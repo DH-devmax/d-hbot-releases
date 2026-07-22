@@ -1,0 +1,106 @@
+name: Publish DH BOT release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "incoming/**/release.json"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要校验并发布的 incoming 版本，例如 v3.0.0-beta.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-dh-bot-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release staging
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select and validate release manifest
+        id: manifest
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG}" ]]; then
+            tag="${INPUT_TAG}"
+          else
+            changed="$(git diff --name-only "${BEFORE_SHA}" "${CURRENT_SHA}" -- 'incoming/**/release.json' || true)"
+            tag="$(printf '%s\n' "${changed}" | sed -n 's#^incoming/\([^/][^/]*\)/release\.json$#\1#p' | tail -n 1)"
+          fi
+          [[ "${tag}" =~ ^v3\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo "版本标签格式不正确"; exit 1; }
+          manifest="incoming/${tag}/release.json"
+          [[ -f "${manifest}" ]] || { echo "缺少发布清单：${manifest}"; exit 1; }
+          jq -e --arg tag "${tag}" '
+            .schema == 1 and
+            .tag == $tag and
+            .sourceRepository == "DH-devmax/d-hbot" and
+            (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.files | type == "array" and length > 0)
+          ' "${manifest}" >/dev/null
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify release boundary and checksums
+        shell: bash
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dir="incoming/${TAG}"
+          manifest="${dir}/release.json"
+          mapfile -t files < <(jq -r '.files[]' "${manifest}")
+          [[ "${#files[@]}" -gt 0 ]] || { echo "发布清单为空"; exit 1; }
+          for file in "${files[@]}"; do
+            [[ "${file}" != */* && "${file}" != *\\* && "${file}" != .* ]] || { echo "文件名包含路径或隐藏文件：${file}"; exit 1; }
+            [[ "${file}" != *.rs && "${file}" != *.ts && "${file}" != *.tsx && "${file}" != *.go && "${file}" != *.pdb && "${file}" != *.map ]] || { echo "发布包包含源码或调试文件：${file}"; exit 1; }
+            [[ "${file}" != *fixture* && "${file}" != *Fixture* ]] || { echo "发布包包含开发 Fixture：${file}"; exit 1; }
+            [[ -f "${dir}/${file}" ]] || { echo "清单文件不存在：${file}"; exit 1; }
+          done
+          [[ -f "${dir}/SHA256SUMS.txt" ]] || { echo "缺少 SHA256SUMS.txt"; exit 1; }
+          (cd "${dir}" && sha256sum -c SHA256SUMS.txt)
+          jq -e --argjson count "${#files[@]}" '.files | length == $count' "${manifest}" >/dev/null
+
+      - name: Create public GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: DH-devmax/d-hbot-releases
+          tag_name: ${{ steps.manifest.outputs.tag }}
+          name: ${{ steps.manifest.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.manifest.outputs.tag, '-') }}
+          files: |
+            incoming/${{ steps.manifest.outputs.tag }}/*.exe
+            incoming/${{ steps.manifest.outputs.tag }}/*.zip
+            incoming/${{ steps.manifest.outputs.tag }}/*.md
+            incoming/${{ steps.manifest.outputs.tag }}/*.pdf
+            incoming/${{ steps.manifest.outputs.tag }}/DH-BOT-Default-Rules.json
+            incoming/${{ steps.manifest.outputs.tag }}/SHA256SUMS.txt
+
+      - name: Remove staged files after release
+        shell: bash
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf "incoming/${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add incoming
+          git diff --cached --quiet || git commit -m "chore: remove staged ${TAG} artifacts"
+          git push
